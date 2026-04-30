@@ -12,7 +12,6 @@
 #include "orion2_can_comms.hpp"
 #include "stm32l4xx_hal_can.h"
 #include "ws_can_comms.hpp"
-#include <cinttypes>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -108,22 +107,22 @@ void processTerminalCommand() {
 
   // Check if the user typed a CAN injection command
   // Uses SCNx32 to guarantee proper 32-bit hex reading on ARM architectures
-  if (sscanf(uartRxBuffer, "CAN %" SCNx32 " %" SCNx32 " %" SCNx32 " %" SCNx32 " %" SCNx32 " %" SCNx32 " %" SCNx32 " %" SCNx32 " %" SCNx32, &id, &d[0],
-             &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]) == 9) {
+  if (sscanf(uartRxBuffer, "CAN %x %x %x %x %x %x %x %x %x", &id, &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]) == 9) {
     uint8_t rxData[8];
     for (int i = 0; i < 8; i++)
-      rxData[i] = (uint8_t)d[i];
+      rxData[i] = static_cast<uint8_t>(d[i]);
 
     // Route injected CAN message to the appropriate parser
     if (orion.isOrion2Message(id)) {
       uint16_t offset = (id == 0x36) ? 0x36 : (id - orion.getBaseAddr());
       orion.parseMeasurement(static_cast<Orion2::MessageID>(offset), rxData);
-      UART_Printf("Injected to Orion2: ID %" PRIX32 "\r\n", id);
+      UART_Printf("Injected to Orion2: ID %X\r\n", id);
     } else if (ws.isWaveSculptorMessage(id)) {
-      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(id - ws.getBaseAddr()), rxData);
-      UART_Printf("Injected to WaveSculptor: ID %" PRIX32 "\r\n", id);
+      uint16_t offset = id - ws.getBaseAddr();
+      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(offset), rxData);
+      UART_Printf("Injected to WaveSculptor: ID %X\r\n", id);
     } else {
-      UART_Printf("Ignored ID %" PRIX32 "\r\n", id);
+      UART_Printf("Ignored ID %X\r\n", id);
     }
   } else {
     UART_Printf("Invalid Command. Use: CAN <ID> <B0>..<B7> in HEX\r\n");
@@ -159,7 +158,8 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
       uint16_t offset = (id == 0x36) ? 0x36 : (id - orion.getBaseAddr());
       orion.parseMeasurement(static_cast<Orion2::MessageID>(offset), rxData);
     } else if (ws.isWaveSculptorMessage(id)) {
-      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(id - ws.getBaseAddr()), rxData);
+      uint16_t offset = id - ws.getBaseAddr();
+      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(offset), rxData);
     }
   }
 }

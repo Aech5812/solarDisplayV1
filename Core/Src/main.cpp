@@ -101,31 +101,59 @@ void UART_Printf(const char *fmt, ...) {
   HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100);
 }
 
+// Trim helper - removes leading/trailing whitespace and CR/LF
+static char *trimBuffer(char *buf) {
+  while (*buf == ' ' || *buf == '\t')
+    buf++; // Trim leading spaces
+  char *end = buf + strlen(buf) - 1;
+  while (end > buf && (*end == '\r' || *end == '\n' || *end == ' ' || *end == '\t')) {
+    *end = '\0';
+    end--;
+  }
+  return buf;
+}
+
 void processTerminalCommand() {
-  uint32_t id;
-  uint32_t d[8];
+  unsigned int id = 0;
+  unsigned int d[8] = {0};
 
-  // Check if the user typed a CAN injection command
-  // Uses SCNx32 to guarantee proper 32-bit hex reading on ARM architectures
-  if (sscanf(uartRxBuffer, "CAN %x %x %x %x %x %x %x %x %x", &id, &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]) == 9) {
-    uint8_t rxData[8];
-    for (int i = 0; i < 8; i++)
-      rxData[i] = static_cast<uint8_t>(d[i]);
+  // Trim whitespace and control characters from buffer
+  char *trimmed = trimBuffer(uartRxBuffer);
 
-    // Route injected CAN message to the appropriate parser
-    if (orion.isOrion2Message(id)) {
-      uint16_t offset = (id == 0x36) ? 0x36 : (id - orion.getBaseAddr());
-      orion.parseMeasurement(static_cast<Orion2::MessageID>(offset), rxData);
-      UART_Printf("Injected to Orion2: ID %X\r\n", id);
-    } else if (ws.isWaveSculptorMessage(id)) {
-      uint16_t offset = id - ws.getBaseAddr();
-      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(offset), rxData);
-      UART_Printf("Injected to WaveSculptor: ID %X\r\n", id);
+  // Debug: Show what we received
+  UART_Printf("\r\nRX: [%s] (len=%d)\r\n", trimmed, strlen(trimmed));
+
+  // Check if the string starts with "CAN " (case-sensitive)
+  if (strncmp(trimmed, "CAN ", 4) == 0) {
+
+    // Parse hex values after "CAN " prefix
+    int parsedArgs = sscanf(trimmed + 4, "%x %x %x %x %x %x %x %x %x", &id, &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]);
+
+    UART_Printf("Parsed: %d args, ID=%X, Data=[%X %X %X %X %X %X %X %X]\r\n", parsedArgs, id, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+
+    if (parsedArgs == 9) {
+      uint8_t rxData[8];
+      for (int i = 0; i < 8; i++) {
+        rxData[i] = static_cast<uint8_t>(d[i]);
+      }
+
+      // Route injected CAN message to the appropriate parser
+      if (orion.isOrion2Message(id)) {
+        uint16_t offset = (id == 0x36) ? 0x36 : (id - orion.getBaseAddr());
+        orion.parseMeasurement(static_cast<Orion2::MessageID>(offset), rxData);
+        UART_Printf("Injected to Orion2: ID %X\r\n", id);
+      } else if (ws.isWaveSculptorMessage(id)) {
+        uint16_t offset = id - ws.getBaseAddr();
+        ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(offset), rxData);
+        UART_Printf("Injected to WaveSculptor: ID %X\r\n", id);
+      } else {
+        UART_Printf("Ignored ID %X\r\n", id);
+      }
     } else {
-      UART_Printf("Ignored ID %X\r\n", id);
+      UART_Printf("\r\nInvalid Data! (Parsed %d out of 9 hex numbers)\r\n", parsedArgs);
     }
   } else {
-    UART_Printf("Invalid Command. Use: CAN <ID> <B0>..<B7> in HEX\r\n");
+    UART_Printf("Error: Command must start with 'CAN ' (got: %.4s)\r\n", trimmed);
   }
 }
 
@@ -137,9 +165,18 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
       if (uartRxIndex > 0)
         processTerminalCommand();
       uartRxIndex = 0; // Reset buffer
-    } else if (uartRxIndex < sizeof(uartRxBuffer) - 1) {
+    }
+    // FIX: Safely handle Backspace and Delete keys
+    else if (uartRxByte == '\b' || uartRxByte == 0x7F) {
+      if (uartRxIndex > 0) {
+        uartRxIndex--; // Erase the last character from the buffer memory
+      }
+    }
+    // Normal character saving
+    else if (uartRxIndex < sizeof(uartRxBuffer) - 1) {
       uartRxBuffer[uartRxIndex++] = uartRxByte;
     }
+
     // Re-arm interrupt
     HAL_UART_Receive_IT(&huart2, &uartRxByte, 1);
   }
@@ -174,6 +211,8 @@ void sendGenieObject(uint8_t object, uint8_t index, uint16_t data) {
   message[4] = data & 0xFF;
   message[5] = message[0] ^ message[1] ^ message[2] ^ message[3] ^ message[4];
   HAL_UART_Transmit(&huart1, message, 6, 100);
+  UART_Printf("obj=0x%02X, idx=0x%02X, data=%d (0x%04X) [0x%02X%02X]\n", object, index, data, data, message[3], message[4]);
+  UART_Printf("%02X%02X%02X%02X%02X%02X\n", message[0], message[1], message[2], message[3], message[4], message[5]);
   HAL_Delay(2); // Prevent buffer overrun on display
 }
 /* USER CODE END 0 */
@@ -276,7 +315,7 @@ int main(void) {
     }
 
     // --- 10 Hz (100ms) DISPLAY UPDATE LOOP ---
-    if (currentMillis - lastDisplayTime >= 100) {
+    if (currentMillis - lastDisplayTime >= 2000) {
       lastDisplayTime = currentMillis;
 
       // Fetch smoothed values and cast to integers for display
@@ -413,7 +452,7 @@ static void MX_USART1_UART_Init(void) {
 
   /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
-  huart1.Init.BaudRate = 9600;
+  huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
   huart1.Init.StopBits = UART_STOPBITS_1;
   huart1.Init.Parity = UART_PARITY_NONE;

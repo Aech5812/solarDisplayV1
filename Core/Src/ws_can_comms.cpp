@@ -2,10 +2,9 @@
  * @file ws_can_comms.cpp
  * @author James Metcalf (jammetc@siue.edu)
  * @brief Implementation of WaveSculptor CAN communications class based on
- * Prohelion's documentation at
- * https://docs.prohelion.com/Motor_Controllers/WaveSculptor22/User_Manual/Appendix_C.html
- * @version 0.2
- * @date 2026-03-29
+ * raw DBC definitions for accurate byte mapping.
+ * @version 0.3
+ * @date 2026-05-01
  *
  * @copyright Copyright (c) 2026
  *
@@ -16,7 +15,6 @@
 #include <cstdio>
 #include <cstring>
 
-// UPDATE: Constructor uses CAN_HandleTypeDef
 WaveSculptor::WaveSculptor(CAN_HandleTypeDef *hcan, uint16_t baseAddr, uint16_t dcuBaseAddr)
     : hcan_(hcan), baseAddr_(baseAddr), dcuBaseAddr_(dcuBaseAddr) {}
 
@@ -94,7 +92,7 @@ HAL_StatusTypeDef WaveSculptor::sendReset() {
 }
 
 // ============================================================================
-// Measurement Parsing
+// Measurement Parsing (Corrected to DBC Specification)
 // ============================================================================
 
 HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, const uint8_t *rxData) {
@@ -107,8 +105,9 @@ HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, con
 
   switch (id) {
   case MessageID::Identification: {
-    memcpy(&serialNumber_, &rxData[0], sizeof(serialNumber_));
-    memcpy(&deviceID_, &rxData[4], sizeof(deviceID_));
+    // DBC: TritiumID 0|32, SerialNumber 32|32
+    memcpy(&deviceID_, &rxData[0], sizeof(deviceID_));
+    memcpy(&serialNumber_, &rxData[4], sizeof(serialNumber_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
@@ -118,11 +117,12 @@ HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, con
     break;
   }
   case MessageID::Status: {
-    memcpy(&receiveErrorCount_, &rxData[0], sizeof(receiveErrorCount_));
-    memcpy(&transmitErrorCount_, &rxData[1], sizeof(transmitErrorCount_));
-    memcpy(&activeMotor_, &rxData[2], sizeof(activeMotor_));
-    memcpy(&errorFlags_, &rxData[4], sizeof(errorFlags_));
-    memcpy(&limitFlags_, &rxData[6], sizeof(limitFlags_));
+    // DBC: Limits 0|16, Errors 16|16, ActiveMotor 32|16, TxErr 48|8, RxErr 56|8
+    memcpy(&limitFlags_, &rxData[0], sizeof(limitFlags_));
+    memcpy(&errorFlags_, &rxData[2], sizeof(errorFlags_));
+    memcpy(&activeMotor_, &rxData[4], sizeof(activeMotor_));
+    transmitErrorCount_ = rxData[6];
+    receiveErrorCount_ = rxData[7];
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
@@ -133,28 +133,31 @@ HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, con
     break;
   }
   case MessageID::Bus: {
-    memcpy(&busCurrent_, &rxData[0], sizeof(busCurrent_));
-    memcpy(&busVoltage_, &rxData[4], sizeof(busVoltage_));
+    // DBC: BusVoltage 0|32, BusCurrent 32|32
+    memcpy(&busVoltage_, &rxData[0], sizeof(busVoltage_));
+    memcpy(&busCurrent_, &rxData[4], sizeof(busCurrent_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Bus - Current=%.2f A, Voltage=%.2f V\n", busCurrent_, busVoltage_);
+      printf("WS: Bus - Voltage=%.2f V, Current=%.2f A\n", busVoltage_, busCurrent_);
     }
 #endif
     break;
   }
   case MessageID::Velocity: {
-    memcpy(&vehicleVelocity_, &rxData[0], sizeof(vehicleVelocity_));
-    memcpy(&motorVelocity_, &rxData[4], sizeof(motorVelocity_));
+    // DBC: MotorVelocity 0|32, VehicleVelocity 32|32
+    memcpy(&motorVelocity_, &rxData[0], sizeof(motorVelocity_));
+    memcpy(&vehicleVelocity_, &rxData[4], sizeof(vehicleVelocity_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Velocity - Vehicle=%.2f m/s, Motor=%.2f RPM\n", vehicleVelocity_, motorVelocity_);
+      printf("WS: Velocity - Motor=%.2f RPM, Vehicle=%.2f m/s\n", motorVelocity_, vehicleVelocity_);
     }
 #endif
     break;
   }
   case MessageID::PhaseCurrent: {
+    // DBC: PhaseCurrentB 0|32, PhaseCurrentC 32|32
     memcpy(&phaseBCurrent_, &rxData[0], sizeof(phaseBCurrent_));
     memcpy(&phaseCCurrent_, &rxData[4], sizeof(phaseCCurrent_));
 #if WS_DEBUG_ENABLED
@@ -166,40 +169,44 @@ HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, con
     break;
   }
   case MessageID::MotorVoltageVector: {
-    memcpy(&dVoltage_, &rxData[0], sizeof(dVoltage_));
-    memcpy(&qVoltage_, &rxData[4], sizeof(qVoltage_));
+    // DBC: Vq 0|32, Vd 32|32
+    memcpy(&qVoltage_, &rxData[0], sizeof(qVoltage_));
+    memcpy(&dVoltage_, &rxData[4], sizeof(dVoltage_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Motor Voltage - D=%.2f V, Q=%.2f V\n", dVoltage_, qVoltage_);
+      printf("WS: Motor Voltage - Q=%.2f V, D=%.2f V\n", qVoltage_, dVoltage_);
     }
 #endif
     break;
   }
   case MessageID::MotorCurrentVector: {
-    memcpy(&dCurrent_, &rxData[0], sizeof(dCurrent_));
-    memcpy(&qCurrent_, &rxData[4], sizeof(qCurrent_));
+    // DBC: Iq 0|32, Id 32|32
+    memcpy(&qCurrent_, &rxData[0], sizeof(qCurrent_));
+    memcpy(&dCurrent_, &rxData[4], sizeof(dCurrent_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Motor Current - D=%.2f A, Q=%.2f A\n", dCurrent_, qCurrent_);
+      printf("WS: Motor Current - Q=%.2f A, D=%.2f A\n", qCurrent_, dCurrent_);
     }
 #endif
     break;
   }
   case MessageID::MotorBackEMF: {
-    memcpy(&dBackEMF_, &rxData[0], sizeof(dBackEMF_));
-    memcpy(&qBackEMF_, &rxData[4], sizeof(qBackEMF_));
+    // DBC: BEMFq 0|32, BEMFd 32|32
+    memcpy(&qBackEMF_, &rxData[0], sizeof(qBackEMF_));
+    memcpy(&dBackEMF_, &rxData[4], sizeof(dBackEMF_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Back-EMF - D=%.2f V, Q=%.2f V\n", dBackEMF_, qBackEMF_);
+      printf("WS: Back-EMF - Q=%.2f V, D=%.2f V\n", qBackEMF_, dBackEMF_);
     }
 #endif
     break;
   }
   case MessageID::VoltageRail15V: {
-    memcpy(&measured15VSupply_, &rxData[0], sizeof(measured15VSupply_));
+    // DBC: Reserved 0|32, Supply15V 32|32
+    memcpy(&measured15VSupply_, &rxData[4], sizeof(measured15VSupply_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
@@ -209,28 +216,31 @@ HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, con
     break;
   }
   case MessageID::VoltageRail3V3_1V9: {
-    memcpy(&measured3V3Supply_, &rxData[0], sizeof(measured3V3Supply_));
-    memcpy(&measured1V9Supply_, &rxData[4], sizeof(measured1V9Supply_));
+    // DBC: Supply1V9 0|32, Supply3V3 32|32
+    memcpy(&measured1V9Supply_, &rxData[0], sizeof(measured1V9Supply_));
+    memcpy(&measured3V3Supply_, &rxData[4], sizeof(measured3V3Supply_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Power Rails - 3V3=%.2f V, 1V9=%.2f V\n", measured3V3Supply_, measured1V9Supply_);
+      printf("WS: Power Rails - 1V9=%.2f V, 3V3=%.2f V\n", measured1V9Supply_, measured3V3Supply_);
     }
 #endif
     break;
   }
   case MessageID::HeatSinkMotorTemp: {
-    memcpy(&heatsinkTemp_, &rxData[0], sizeof(heatsinkTemp_));
-    memcpy(&motorTemp_, &rxData[4], sizeof(motorTemp_));
+    // DBC: MotorTemp 0|32, HeatsinkTemp 32|32
+    memcpy(&motorTemp_, &rxData[0], sizeof(motorTemp_));
+    memcpy(&heatsinkTemp_, &rxData[4], sizeof(heatsinkTemp_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Temperature - Heatsink=%.2f C, Motor=%.2f C\n", heatsinkTemp_, motorTemp_);
+      printf("WS: Temperature - Motor=%.2f C, Heatsink=%.2f C\n", motorTemp_, heatsinkTemp_);
     }
 #endif
     break;
   }
   case MessageID::DSPTemp: {
+    // DBC: DspBoardTemp 0|32, Reserved 32|32
     memcpy(&dspBoardTemp_, &rxData[0], sizeof(dspBoardTemp_));
 #if WS_DEBUG_ENABLED
     {
@@ -241,22 +251,24 @@ HAL_StatusTypeDef WaveSculptor::parseMeasurement(WaveSculptor::MessageID id, con
     break;
   }
   case MessageID::OdometerBusAh: {
-    memcpy(&dcBusAh_, &rxData[0], sizeof(dcBusAh_));
-    memcpy(&odometer_, &rxData[4], sizeof(odometer_));
+    // DBC: Odometer 0|32, DCBusAh 32|32
+    memcpy(&odometer_, &rxData[0], sizeof(odometer_));
+    memcpy(&dcBusAh_, &rxData[4], sizeof(dcBusAh_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Energy/Distance - BusAh=%.2f Ah, Odometer=%.2f km\n", dcBusAh_, odometer_);
+      printf("WS: Energy/Distance - Odometer=%.2f m, BusAh=%.2f Ah\n", odometer_, dcBusAh_);
     }
 #endif
     break;
   }
   case MessageID::SlipSpeed: {
+    // DBC: SlipSpeed 0|32, Reserved 32|32
     memcpy(&slipSpeed_, &rxData[0], sizeof(slipSpeed_));
 #if WS_DEBUG_ENABLED
     {
       UartGuard guard;
-      printf("WS: Slip Speed - %.2f m/s\n", slipSpeed_);
+      printf("WS: Slip Speed - %.2f Hz\n", slipSpeed_);
     }
 #endif
     break;

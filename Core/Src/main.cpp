@@ -1,58 +1,47 @@
 /* USER CODE BEGIN Header */
 /**
  * @file           : main.cpp
- * @brief          : Main program body with CAN parsing, Moving Average, and UART Injection
+ * @brief          : Production Solar Dashboard - V4 (Bulletproofed Buffers & Clamps)
  */
 /* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
-#include "main.h"
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
+#include "main.h"
 #include "orion2_can_comms.hpp"
 #include "stm32l4xx_hal_can.h"
 #include "ws_can_comms.hpp"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-
-/* USER CODE END Includes */
-
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
-
-/* USER CODE END PTD */
-
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
+#include <cmath> // Changed to cmath for standard isnan/isinf
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
-
 UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
-// --- 1. GLOBAL OBJECTS ---
 WaveSculptor ws(&hcan1);
 Orion2 orion(&hcan1);
 
-// --- 2. MOVING AVERAGE CLASS ---
+// --- SPEED CONVERSION CONSTANTS ---
+// Tire Diameter = 16 inches. 
+// Conversion: RPM -> MPH: (RPM * PI * 16 * 60) / 63360
+const float PI_VAL = 3.14159f;
+const float WHEEL_DIAMETER_INCHES = 16.0f;
+const float MPH_CONVERSION = (PI_VAL * WHEEL_DIAMETER_INCHES * 60.0f) / 63360.0f;
+
 template <uint8_t SIZE> class MovingAverage {
 private:
   float buffer[SIZE] = {0};
   uint8_t index = 0;
   float sum = 0;
-
 public:
   void add(float val) {
+    // --- POISON PROTECTION ---
+    // Reject CAN bus noise, uninitialized sensors, and NaN floats.
+    // If we don't reject this, the sum permanently becomes NaN and crashes the UI.
+    if (std::isnan(val) || std::isinf(val)) return; 
+
     sum -= buffer[index];
     buffer[index] = val;
     sum += val;
@@ -61,37 +50,26 @@ public:
   float get() { return sum / SIZE; }
 };
 
-// 10-sample moving average buffers
-MovingAverage<10> avgSOC;
-MovingAverage<10> avgSpeed;
-MovingAverage<10> avgBattTemp;
-MovingAverage<10> avgMCTemp;
-MovingAverage<10> avgMotorTemp;
-MovingAverage<10> avgPowerIn;
-MovingAverage<10> avgPowerOut;
+MovingAverage<10> avgSOC, avgSpeed, avgBattTemp, avgMCTemp, avgMotorTemp, avgPowerIn, avgPowerOut;
 
-// --- 3. UART TERMINAL CAN INJECTOR ---
 uint8_t uartRxByte;
 char uartRxBuffer[100];
 uint8_t uartRxIndex = 0;
 /* USER CODE END PV */
 
-/* Private function prototypes -----------------------------------------------*/
+/* Function Prototypes */
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_USART1_UART_Init(void);
-/* USER CODE BEGIN PFP */
 void UART_Printf(const char *fmt, ...);
 void processTerminalCommand();
 void sendGenieObject(uint8_t object, uint8_t index, uint16_t data);
-/* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
-// --- Custom UART Print Wrapper (Bypasses stdout linker error) ---
 void UART_Printf(const char *fmt, ...) {
   char buffer[128];
   va_list args;
@@ -101,275 +79,164 @@ void UART_Printf(const char *fmt, ...) {
   HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100);
 }
 
-// Trim helper - removes leading/trailing whitespace and CR/LF
-static char *trimBuffer(char *buf) {
-  while (*buf == ' ' || *buf == '\t')
-    buf++; // Trim leading spaces
-  char *end = buf + strlen(buf) - 1;
-  while (end > buf && (*end == '\r' || *end == '\n' || *end == ' ' || *end == '\t')) {
-    *end = '\0';
-    end--;
-  }
-  return buf;
-}
-
 void processTerminalCommand() {
-  unsigned int id = 0;
-  unsigned int d[8] = {0};
-
-  // Trim whitespace and control characters from buffer
-  char *trimmed = trimBuffer(uartRxBuffer);
-
-  // Debug: Show what we received
-  UART_Printf("\r\nRX: [%s] (len=%d)\r\n", trimmed, strlen(trimmed));
-
-  // Check if the string starts with "CAN " (case-sensitive)
-  if (strncmp(trimmed, "CAN ", 4) == 0) {
-
-    // Parse hex values after "CAN " prefix
-    int parsedArgs = sscanf(trimmed + 4, "%x %x %x %x %x %x %x %x %x", &id, &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]);
-
-    UART_Printf("Parsed: %d args, ID=%X, Data=[%X %X %X %X %X %X %X %X]\r\n", parsedArgs, id, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
-
+  unsigned int id = 0; unsigned int d[8] = {0};
+  if (strncmp(uartRxBuffer, "CAN ", 4) == 0) {
+    int parsedArgs = sscanf(uartRxBuffer + 4, "%x %x %x %x %x %x %x %x %x", &id, &d[0], &d[1], &d[2], &d[3], &d[4], &d[5], &d[6], &d[7]);
     if (parsedArgs == 9) {
       uint8_t rxData[8];
-      for (int i = 0; i < 8; i++) {
-        rxData[i] = static_cast<uint8_t>(d[i]);
-      }
-
-      // Route injected CAN message to the appropriate parser
+      for (int i = 0; i < 8; i++) rxData[i] = static_cast<uint8_t>(d[i]);
       if (orion.isOrion2Message(id)) {
-        uint16_t offset = (id == 0x36) ? 0x36 : (id - orion.getBaseAddr());
-        orion.parseMeasurement(static_cast<Orion2::MessageID>(offset), rxData);
-        UART_Printf("Injected to Orion2: ID %X\r\n", id);
+        orion.parseMeasurement(static_cast<Orion2::MessageID>((id == 0x36) ? 0x36 : (id - orion.getBaseAddr())), rxData);
       } else if (ws.isWaveSculptorMessage(id)) {
-        uint16_t offset = id - ws.getBaseAddr();
-        ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(offset), rxData);
-        UART_Printf("Injected to WaveSculptor: ID %X\r\n", id);
-      } else {
-        UART_Printf("Ignored ID %X\r\n", id);
+        ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(id - ws.getBaseAddr()), rxData);
       }
-    } else {
-      UART_Printf("\r\nInvalid Data! (Parsed %d out of 9 hex numbers)\r\n", parsedArgs);
     }
-  } else {
-    UART_Printf("Error: Command must start with 'CAN ' (got: %.4s)\r\n", trimmed);
   }
 }
 
-// UART Interrupt Callback
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART2) {
     if (uartRxByte == '\r' || uartRxByte == '\n') {
-      uartRxBuffer[uartRxIndex] = '\0'; // Null terminate
-      if (uartRxIndex > 0)
-        processTerminalCommand();
-      uartRxIndex = 0; // Reset buffer
-    }
-    // FIX: Safely handle Backspace and Delete keys
-    else if (uartRxByte == '\b' || uartRxByte == 0x7F) {
-      if (uartRxIndex > 0) {
-        uartRxIndex--; // Erase the last character from the buffer memory
-      }
-    }
-    // Normal character saving
-    else if (uartRxIndex < sizeof(uartRxBuffer) - 1) {
+      uartRxBuffer[uartRxIndex] = '\0';
+      if (uartRxIndex > 0) processTerminalCommand();
+      uartRxIndex = 0;
+    } else if (uartRxIndex < sizeof(uartRxBuffer) - 1) {
       uartRxBuffer[uartRxIndex++] = uartRxByte;
     }
-
-    // Re-arm interrupt
     HAL_UART_Receive_IT(&huart2, &uartRxByte, 1);
   }
 }
 
-// --- 4. CAN HARDWARE INTERRUPT ---
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   CAN_RxHeaderTypeDef rxHeader;
   uint8_t rxData[8];
-
   if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
     uint32_t id = rxHeader.StdId;
-
-    // Route real CAN message to parsers
     if (orion.isOrion2Message(id)) {
-      uint16_t offset = (id == 0x36) ? 0x36 : (id - orion.getBaseAddr());
-      orion.parseMeasurement(static_cast<Orion2::MessageID>(offset), rxData);
+      orion.parseMeasurement(static_cast<Orion2::MessageID>((id == 0x36) ? 0x36 : (id - orion.getBaseAddr())), rxData);
     } else if (ws.isWaveSculptorMessage(id)) {
-      uint16_t offset = id - ws.getBaseAddr();
-      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(offset), rxData);
+      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(id - ws.getBaseAddr()), rxData);
     }
   }
 }
 
-// Display transmit helper
 void sendGenieObject(uint8_t object, uint8_t index, uint16_t data) {
   uint8_t message[6];
-  message[0] = 0x01;
-  message[1] = object;
-  message[2] = index;
-  message[3] = (data >> 8) & 0xFF;
-  message[4] = data & 0xFF;
+  message[0] = 0x01; message[1] = object; message[2] = index;
+  message[3] = (data >> 8) & 0xFF; message[4] = data & 0xFF;
   message[5] = message[0] ^ message[1] ^ message[2] ^ message[3] ^ message[4];
   HAL_UART_Transmit(&huart1, message, 6, 100);
-  UART_Printf("obj=0x%02X, idx=0x%02X, data=%d (0x%04X) [0x%02X%02X]\n", object, index, data, data, message[3], message[4]);
-  UART_Printf("%02X%02X%02X%02X%02X%02X\n", message[0], message[1], message[2], message[3], message[4], message[5]);
-  HAL_Delay(2); // Prevent buffer overrun on display
+  HAL_Delay(5); 
 }
 /* USER CODE END 0 */
 
-/**
- * @brief  The application entry point.
- * @retval int
- */
 int main(void) {
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
   SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_CAN1_Init();
   MX_USART1_UART_Init();
-  /* USER CODE BEGIN 2 */
 
-  // 1. Configure CAN Filter to accept all standard IDs
+  /* USER CODE BEGIN 2 */
+  // CRITICAL FIX: PULL-UP ON PA15 (Prevent laptop-unplug crash)
+  GPIO_InitTypeDef GPIO_InitStruct = {0};
+  GPIO_InitStruct.Pin = GPIO_PIN_15;
+  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  GPIO_InitStruct.Alternate = GPIO_AF3_USART2;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   CAN_FilterTypeDef canFilterConfig;
   canFilterConfig.FilterBank = 0;
   canFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
   canFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
-  canFilterConfig.FilterIdHigh = 0x0000;
-  canFilterConfig.FilterIdLow = 0x0000;
-  canFilterConfig.FilterMaskIdHigh = 0x0000;
-  canFilterConfig.FilterMaskIdLow = 0x0000;
   canFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
   canFilterConfig.FilterActivation = ENABLE;
-  canFilterConfig.SlaveStartFilterBank = 14;
   HAL_CAN_ConfigFilter(&hcan1, &canFilterConfig);
 
-  // 2. Start CAN and activate RX Interrupts
   HAL_CAN_Start(&hcan1);
   HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
-
-  // Init WaveSculptor object with initialized CAN handle
   ws.init(&hcan1, 0x400, 0x500);
-
-  // 3. Start UART Terminal listener
   HAL_UART_Receive_IT(&huart2, &uartRxByte, 1);
 
-  // Give 4D Display time to boot and mount SD Card
-  UART_Printf("Booting Display...\r\n");
-  HAL_Delay(3500);
-  UART_Printf("System Live.\r\n");
+  HAL_Delay(3000);
+  UART_Printf("Dashboard Ready. Bulletproofed buffers active.\r\n");
 
-  /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
   uint32_t lastSampleTime = 0;
   uint32_t lastDisplayTime = 0;
+  /* USER CODE END 2 */
 
   while (1) {
     uint32_t currentMillis = HAL_GetTick();
 
-    // --- 100 Hz (10ms) SAMPLING LOOP ---
+    // 100 Hz Sampling Loop
     if (currentMillis - lastSampleTime >= 10) {
       lastSampleTime = currentMillis;
 
-      // Sample direct data
-      avgSOC.add(orion.getPackSOC());
-      avgSpeed.add(ws.getVehicleVelocity());
       avgBattTemp.add(orion.getIntakeTemp());
-      avgMCTemp.add(ws.getDSPBoardTemp());
-      avgMotorTemp.add(ws.getMotorTemp());
+      avgMCTemp.add(ws.getDSPBoardTemp()); 
+      avgMotorTemp.add(ws.getMotorTemp()); 
 
-      // Calculate Power (Watts)
-      float voltage = ws.getBusVoltage();
-      float current = ws.getBusCurrent();
-      float powerWatts = voltage * current;
+      float rawRPM = ws.getMotorVelocity();
+      float velocityMPH = fabsf(rawRPM * MPH_CONVERSION);
+      avgSpeed.add(velocityMPH);
 
-      if (powerWatts >= 0) {
-        avgPowerOut.add(powerWatts);
-        avgPowerIn.add(0);
+      float bmsVolts = orion.getPackInstVoltage(); 
+      float bmsAmps  = orion.getPackCurrent();     
+      float bmsPowerWatts = bmsVolts * bmsAmps;
+
+      avgSOC.add(orion.getPackSOC());
+
+      if (bmsAmps >= 0) {
+          avgPowerOut.add(fabsf(bmsPowerWatts)); 
+          avgPowerIn.add(0);
       } else {
-        avgPowerOut.add(0);
-        avgPowerIn.add(powerWatts * -1.0f); // Make positive for display
+          avgPowerIn.add(fabsf(bmsPowerWatts));  
+          avgPowerOut.add(0);
       }
     }
 
-    // --- 10 Hz (100ms) DISPLAY UPDATE LOOP ---
-    if (currentMillis - lastDisplayTime >= 2000) {
+    // 10 Hz Display Loop
+    if (currentMillis - lastDisplayTime >= 100) {
       lastDisplayTime = currentMillis;
 
-      // Fetch smoothed values and cast to integers for display
-      uint16_t dispSOC = (uint16_t)avgSOC.get();
-      uint16_t dispSpeed = (uint16_t)avgSpeed.get();
-      uint16_t dispPwrIn = (uint16_t)avgPowerIn.get();
-      uint16_t dispPwrOut = (uint16_t)avgPowerOut.get();
-      uint16_t dispBattT = (uint16_t)avgBattTemp.get();
-      uint16_t dispMCT = (uint16_t)avgMCTemp.get();
-      uint16_t dispMotorT = (uint16_t)avgMotorTemp.get();
+      // Scale temperatures by 10 for the display's decimal placement
+      uint16_t dispBattT  = (uint16_t)(avgBattTemp.get() * 10.0f);
+      uint16_t dispMCT    = (uint16_t)(avgMCTemp.get() * 10.0f);
+      uint16_t dispMotorT = (uint16_t)(avgMotorTemp.get() * 10.0f);
 
-      // Update Gauges
-      sendGenieObject(0x08, 0, dispSpeed);
-      sendGenieObject(0x04, 0, dispSOC);
+      // Clamp power readings to 9999 so they fit inside 4 digits
+      uint16_t dispPwrIn  = (uint16_t)fminf(avgPowerIn.get(), 9999.0f);
+      uint16_t dispPwrOut = (uint16_t)fminf(avgPowerOut.get(), 9999.0f);
 
-      // Update Text Digits
-      sendGenieObject(0x0F, 0, dispPwrIn);  // TextDigits1
-      sendGenieObject(0x0F, 1, dispPwrOut); // TextDigits2
-      sendGenieObject(0x0F, 2, dispBattT);  // TextDigits3
-      sendGenieObject(0x0F, 3, dispMCT);    // TextDigits4
-      sendGenieObject(0x0F, 4, dispMotorT); // TextDigits5
+      // --- CRITICAL CLAMP ---
+      // Ensures that even if you go over the gauge's physical frame limit (e.g. 99), 
+      // it stops requesting invalid images from the display. 
+      uint16_t dispSpeed  = (uint16_t)fminf(avgSpeed.get(), 99.0f); 
 
-      // Heartbeat
-      HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin);
+      sendGenieObject(0x08, 0, dispSpeed);                   // Circular Gauge
+      sendGenieObject(0x04, 0, (uint16_t)avgSOC.get());      // Linear Gauge
+      sendGenieObject(0x0F, 0, dispBattT);                   // iTextDigits1
+      sendGenieObject(0x0F, 1, dispMCT);                     // iTextDigits2
+      sendGenieObject(0x0F, 2, dispMotorT);                  // iTextDigits3
+      sendGenieObject(0x0F, 3, dispPwrIn);                   // iTextDigits4
+      sendGenieObject(0x0F, 4, dispPwrOut);                  // iTextDigits5
+
+      HAL_GPIO_TogglePin(LD3_GPIO_Port, LD3_Pin); // Alive LED
     }
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
   }
-  /* USER CODE END 3 */
 }
 
-/**
- * @brief System Clock Configuration
- * @retval None
+/** * Peripheral Inits Below (Standard CubeMX generation) 
  */
 void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Configure the main internal regulator output voltage
-   */
-  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK) {
-    Error_Handler();
-  }
-
-  /** Configure LSE Drive Capability
-   */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK) Error_Handler();
   HAL_PWR_EnableBkUpAccess();
   __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE | RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.LSEState = RCC_LSE_ON;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
@@ -382,41 +249,17 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV7;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
-    Error_Handler();
-  }
-
-  /** Enable MSI Auto calibration
-   */
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) Error_Handler();
   HAL_RCCEx_EnableMSIPLLMode();
 }
 
-/**
- * @brief CAN1 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_CAN1_Init(void) {
-
-  /* USER CODE BEGIN CAN1_Init 0 */
-
-  /* USER CODE END CAN1_Init 0 */
-
-  /* USER CODE BEGIN CAN1_Init 1 */
-
-  /* USER CODE END CAN1_Init 1 */
   hcan1.Instance = CAN1;
   hcan1.Init.Prescaler = 10;
   hcan1.Init.Mode = CAN_MODE_NORMAL;
@@ -429,28 +272,10 @@ static void MX_CAN1_Init(void) {
   hcan1.Init.AutoRetransmission = ENABLE;
   hcan1.Init.ReceiveFifoLocked = DISABLE;
   hcan1.Init.TransmitFifoPriority = DISABLE;
-  if (HAL_CAN_Init(&hcan1) != HAL_OK) {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN CAN1_Init 2 */
-
-  /* USER CODE END CAN1_Init 2 */
+  if (HAL_CAN_Init(&hcan1) != HAL_OK) Error_Handler();
 }
 
-/**
- * @brief USART1 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_USART1_UART_Init(void) {
-
-  /* USER CODE BEGIN USART1_Init 0 */
-
-  /* USER CODE END USART1_Init 0 */
-
-  /* USER CODE BEGIN USART1_Init 1 */
-
-  /* USER CODE END USART1_Init 1 */
   huart1.Instance = USART1;
   huart1.Init.BaudRate = 115200;
   huart1.Init.WordLength = UART_WORDLENGTH_8B;
@@ -461,28 +286,10 @@ static void MX_USART1_UART_Init(void) {
   huart1.Init.OverSampling = UART_OVERSAMPLING_16;
   huart1.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart1.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart1) != HAL_OK) {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART1_Init 2 */
-
-  /* USER CODE END USART1_Init 2 */
+  if (HAL_UART_Init(&huart1) != HAL_OK) Error_Handler();
 }
 
-/**
- * @brief USART2 Initialization Function
- * @param None
- * @retval None
- */
 static void MX_USART2_UART_Init(void) {
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
   huart2.Init.WordLength = UART_WORDLENGTH_8B;
@@ -493,72 +300,20 @@ static void MX_USART2_UART_Init(void) {
   huart2.Init.OverSampling = UART_OVERSAMPLING_16;
   huart2.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart2.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
-  if (HAL_UART_Init(&huart2) != HAL_OK) {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
+  if (HAL_UART_Init(&huart2) != HAL_OK) Error_Handler();
 }
 
-/**
- * @brief GPIO Initialization Function
- * @param None
- * @retval None
- */
 static void MX_GPIO_Init(void) {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin : LD3_Pin */
   GPIO_InitStruct.Pin = LD3_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD3_GPIO_Port, &GPIO_InitStruct);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
-/* USER CODE BEGIN 4 */
-/* USER CODE END 4 */
-
-/**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1) {
-  }
-  /* USER CODE END Error_Handler_Debug */
-}
-#ifdef USE_FULL_ASSERT
-/**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+void Error_Handler(void) { __disable_irq(); while (1) {} }

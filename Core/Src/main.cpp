@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
  * @file           : main.cpp
- * @brief          : Production Solar Dashboard - V4 (Bulletproofed Buffers & Clamps)
+ * @brief          : Production Solar Dashboard - Final (16 Pole Pairs, Filters, Clamps)
  */
 /* USER CODE END Header */
 
@@ -12,7 +12,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <cmath> // Changed to cmath for standard isnan/isinf
+#include <cmath> // Required for std::isnan and std::isinf
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
@@ -25,10 +25,13 @@ Orion2 orion(&hcan1);
 
 // --- SPEED CONVERSION CONSTANTS ---
 // Tire Diameter = 16 inches. 
-// Conversion: RPM -> MPH: (RPM * PI * 16 * 60) / 63360
+// Conversion: Mechanical RPM -> MPH = (RPM * PI * 16 * 60) / 63360
 const float PI_VAL = 3.14159f;
 const float WHEEL_DIAMETER_INCHES = 16.0f;
 const float MPH_CONVERSION = (PI_VAL * WHEEL_DIAMETER_INCHES * 60.0f) / 63360.0f;
+
+// WaveSculptor reports Electrical RPM. Divide by Pole Pairs to get Mechanical RPM.
+const float MOTOR_POLE_PAIRS = 16.0f; 
 
 template <uint8_t SIZE> class MovingAverage {
 private:
@@ -162,7 +165,7 @@ int main(void) {
   HAL_UART_Receive_IT(&huart2, &uartRxByte, 1);
 
   HAL_Delay(3000);
-  UART_Printf("Dashboard Ready. Bulletproofed buffers active.\r\n");
+  UART_Printf("Dashboard Ready. Filters and Pole Pairs configured.\r\n");
 
   uint32_t lastSampleTime = 0;
   uint32_t lastDisplayTime = 0;
@@ -171,7 +174,7 @@ int main(void) {
   while (1) {
     uint32_t currentMillis = HAL_GetTick();
 
-    // 100 Hz Sampling Loop
+    // --- 100 Hz Sampling Loop ---
     if (currentMillis - lastSampleTime >= 10) {
       lastSampleTime = currentMillis;
 
@@ -179,10 +182,12 @@ int main(void) {
       avgMCTemp.add(ws.getDSPBoardTemp()); 
       avgMotorTemp.add(ws.getMotorTemp()); 
 
-      float rawRPM = ws.getMotorVelocity();
+      // Speed Conversion: Electrical RPM -> Mechanical RPM -> MPH
+      float rawRPM = ws.getMotorVelocity() / MOTOR_POLE_PAIRS;
       float velocityMPH = fabsf(rawRPM * MPH_CONVERSION);
       avgSpeed.add(velocityMPH);
 
+      // BMS Power Calculation
       float bmsVolts = orion.getPackInstVoltage(); 
       float bmsAmps  = orion.getPackCurrent();     
       float bmsPowerWatts = bmsVolts * bmsAmps;
@@ -198,7 +203,7 @@ int main(void) {
       }
     }
 
-    // 10 Hz Display Loop
+    // --- 10 Hz Display Loop ---
     if (currentMillis - lastDisplayTime >= 100) {
       lastDisplayTime = currentMillis;
 
@@ -207,13 +212,12 @@ int main(void) {
       uint16_t dispMCT    = (uint16_t)(avgMCTemp.get() * 10.0f);
       uint16_t dispMotorT = (uint16_t)(avgMotorTemp.get() * 10.0f);
 
-      // Clamp power readings to 9999 so they fit inside 4 digits
+      // Clamp power readings to 9999 so they fit inside 4 digits safely
       uint16_t dispPwrIn  = (uint16_t)fminf(avgPowerIn.get(), 9999.0f);
       uint16_t dispPwrOut = (uint16_t)fminf(avgPowerOut.get(), 9999.0f);
 
       // --- CRITICAL CLAMP ---
-      // Ensures that even if you go over the gauge's physical frame limit (e.g. 99), 
-      // it stops requesting invalid images from the display. 
+      // Ensures the screen doesn't try to draw a missing graphic frame and crash the gauge
       uint16_t dispSpeed  = (uint16_t)fminf(avgSpeed.get(), 99.0f); 
 
       sendGenieObject(0x08, 0, dispSpeed);                   // Circular Gauge

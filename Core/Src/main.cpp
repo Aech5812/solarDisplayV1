@@ -1,7 +1,7 @@
 /* USER CODE BEGIN Header */
 /**
  * @file           : main.cpp
- * @brief          : Production Solar Dashboard - Final (16 Pole Pairs, Filters, Clamps)
+ * @brief          : Production Solar Dashboard - V7 (huart2 Debug Restored + FIFO Drain)
  */
 /* USER CODE END Header */
 
@@ -12,7 +12,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
-#include <cmath> // Required for std::isnan and std::isinf
+#include <cmath>
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
@@ -23,38 +23,31 @@ UART_HandleTypeDef huart2;
 WaveSculptor ws(&hcan1);
 Orion2 orion(&hcan1);
 
-// --- SPEED CONVERSION CONSTANTS ---
-// Tire Diameter = 16 inches. 
-// Conversion: Mechanical RPM -> MPH = (RPM * PI * 16 * 60) / 63360
-const float PI_VAL = 3.14159f;
-const float WHEEL_DIAMETER_INCHES = 16.0f;
-const float MPH_CONVERSION = (PI_VAL * WHEEL_DIAMETER_INCHES * 60.0f) / 63360.0f;
+// The WaveSculptor internally calculates Vehicle Velocity in m/s.
+// 1 m/s = 2.23694 Miles Per Hour
+const float MS_TO_MPH_CONVERSION = 2.23694f;
 
-// WaveSculptor reports Electrical RPM. Divide by Pole Pairs to get Mechanical RPM.
-const float MOTOR_POLE_PAIRS = 16.0f; 
-
+// Rewritten Moving Average to completely eliminate floating-point drift
 template <uint8_t SIZE> class MovingAverage {
 private:
   float buffer[SIZE] = {0};
   uint8_t index = 0;
-  float sum = 0;
 public:
   void add(float val) {
-    // --- POISON PROTECTION ---
-    // Reject CAN bus noise, uninitialized sensors, and NaN floats.
-    // If we don't reject this, the sum permanently becomes NaN and crashes the UI.
     if (std::isnan(val) || std::isinf(val)) return; 
-
-    sum -= buffer[index];
     buffer[index] = val;
-    sum += val;
     index = (index + 1) % SIZE;
   }
-  float get() { return sum / SIZE; }
+  float get() {
+    float sum = 0;
+    for(int i = 0; i < SIZE; i++) sum += buffer[i];
+    return sum / SIZE;
+  }
 };
 
 MovingAverage<10> avgSOC, avgSpeed, avgBattTemp, avgMCTemp, avgMotorTemp, avgPowerIn, avgPowerOut;
 
+// Terminal variables restored
 uint8_t uartRxByte;
 char uartRxBuffer[100];
 uint8_t uartRxIndex = 0;
@@ -73,6 +66,7 @@ void sendGenieObject(uint8_t object, uint8_t index, uint16_t data);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+// Custom UART Print Wrapper for Terminal Debugging
 void UART_Printf(const char *fmt, ...) {
   char buffer[128];
   va_list args;
@@ -82,6 +76,7 @@ void UART_Printf(const char *fmt, ...) {
   HAL_UART_Transmit(&huart2, (uint8_t *)buffer, strlen(buffer), 100);
 }
 
+// Allows manual CAN testing via Serial Monitor
 void processTerminalCommand() {
   unsigned int id = 0; unsigned int d[8] = {0};
   if (strncmp(uartRxBuffer, "CAN ", 4) == 0) {
@@ -98,6 +93,7 @@ void processTerminalCommand() {
   }
 }
 
+// UART Receive Interrupt
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   if (huart->Instance == USART2) {
     if (uartRxByte == '\r' || uartRxByte == '\n') {
@@ -111,19 +107,25 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
   }
 }
 
+// CAN Hardware Interrupt
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan) {
   CAN_RxHeaderTypeDef rxHeader;
   uint8_t rxData[8];
-  if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
-    uint32_t id = rxHeader.StdId;
-    if (orion.isOrion2Message(id)) {
-      orion.parseMeasurement(static_cast<Orion2::MessageID>((id == 0x36) ? 0x36 : (id - orion.getBaseAddr())), rxData);
-    } else if (ws.isWaveSculptorMessage(id)) {
-      ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(id - ws.getBaseAddr()), rxData);
+  
+  // Drain the ENTIRE FIFO to prevent buffer overflows under heavy load
+  while (HAL_CAN_GetRxFifoFillLevel(hcan, CAN_RX_FIFO0) > 0) {
+    if (HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &rxHeader, rxData) == HAL_OK) {
+      uint32_t id = rxHeader.StdId;
+      if (orion.isOrion2Message(id)) {
+        orion.parseMeasurement(static_cast<Orion2::MessageID>((id == 0x36) ? 0x36 : (id - orion.getBaseAddr())), rxData);
+      } else if (ws.isWaveSculptorMessage(id)) {
+        ws.parseMeasurement(static_cast<WaveSculptor::MessageID>(id - ws.getBaseAddr()), rxData);
+      }
     }
   }
 }
 
+// Display Transmit
 void sendGenieObject(uint8_t object, uint8_t index, uint16_t data) {
   uint8_t message[6];
   message[0] = 0x01; message[1] = object; message[2] = index;
@@ -137,13 +139,14 @@ void sendGenieObject(uint8_t object, uint8_t index, uint16_t data) {
 int main(void) {
   HAL_Init();
   SystemClock_Config();
+  
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   MX_CAN1_Init();
   MX_USART1_UART_Init();
 
   /* USER CODE BEGIN 2 */
-  // CRITICAL FIX: PULL-UP ON PA15 (Prevent laptop-unplug crash)
+  // Pull-up on PA15 to prevent the floating pin interrupt crash
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin = GPIO_PIN_15;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
@@ -162,11 +165,12 @@ int main(void) {
   HAL_CAN_Start(&hcan1);
   HAL_CAN_ActivateNotification(&hcan1, CAN_IT_RX_FIFO0_MSG_PENDING);
   ws.init(&hcan1, 0x400, 0x500);
+
   HAL_UART_Receive_IT(&huart2, &uartRxByte, 1);
 
-  HAL_Delay(3000);
-  UART_Printf("Dashboard Ready. Filters and Pole Pairs configured.\r\n");
-
+  HAL_Delay(3000); // Give the 4D Display time to boot
+  UART_Printf("Dashboard Ready. huart2 Restored.\r\n");
+  
   uint32_t lastSampleTime = 0;
   uint32_t lastDisplayTime = 0;
   /* USER CODE END 2 */
@@ -182,9 +186,10 @@ int main(void) {
       avgMCTemp.add(ws.getDSPBoardTemp()); 
       avgMotorTemp.add(ws.getMotorTemp()); 
 
-      // Speed Conversion: Electrical RPM -> Mechanical RPM -> MPH
-      float rawRPM = ws.getMotorVelocity() / MOTOR_POLE_PAIRS;
-      float velocityMPH = fabsf(rawRPM * MPH_CONVERSION);
+      // Native m/s directly to absolute MPH
+      float velocityMPH = fabsf(ws.getVehicleVelocity() * MS_TO_MPH_CONVERSION);
+      // Hard clamp incoming CAN errors so the gauge never vanishes
+      if (velocityMPH > 99.0f) velocityMPH = 99.0f;
       avgSpeed.add(velocityMPH);
 
       // BMS Power Calculation
@@ -207,18 +212,14 @@ int main(void) {
     if (currentMillis - lastDisplayTime >= 100) {
       lastDisplayTime = currentMillis;
 
-      // Scale temperatures by 10 for the display's decimal placement
       uint16_t dispBattT  = (uint16_t)(avgBattTemp.get() * 10.0f);
       uint16_t dispMCT    = (uint16_t)(avgMCTemp.get() * 10.0f);
       uint16_t dispMotorT = (uint16_t)(avgMotorTemp.get() * 10.0f);
 
-      // Clamp power readings to 9999 so they fit inside 4 digits safely
+      // Clamp power to 9999 to guarantee a clean 4-digit fit
       uint16_t dispPwrIn  = (uint16_t)fminf(avgPowerIn.get(), 9999.0f);
       uint16_t dispPwrOut = (uint16_t)fminf(avgPowerOut.get(), 9999.0f);
-
-      // --- CRITICAL CLAMP ---
-      // Ensures the screen doesn't try to draw a missing graphic frame and crash the gauge
-      uint16_t dispSpeed  = (uint16_t)fminf(avgSpeed.get(), 99.0f); 
+      uint16_t dispSpeed  = (uint16_t)avgSpeed.get();
 
       sendGenieObject(0x08, 0, dispSpeed);                   // Circular Gauge
       sendGenieObject(0x04, 0, (uint16_t)avgSOC.get());      // Linear Gauge

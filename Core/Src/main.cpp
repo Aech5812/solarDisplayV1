@@ -27,6 +27,18 @@ Orion2 orion(&hcan1);
 // 1 m/s = 2.23694 Miles Per Hour
 const float MS_TO_MPH_CONVERSION = 2.23694f;
 
+// Orion's coulomb-counted SOC was corrupted by a low-voltage BPS test, so SOC
+// is estimated from pack open-circuit voltage instead until it's recalibrated.
+const float PACK_VOLTAGE_FULL = 134.4f;  // 100% SOC
+const float PACK_VOLTAGE_EMPTY = 83.0f;  // 0% SOC
+
+float estimateSOCFromVoltage(float openCircuitVoltage) {
+  float soc = (openCircuitVoltage - PACK_VOLTAGE_EMPTY) / (PACK_VOLTAGE_FULL - PACK_VOLTAGE_EMPTY) * 100.0f;
+  if (soc < 0.0f) soc = 0.0f;
+  if (soc > 100.0f) soc = 100.0f;
+  return soc;
+}
+
 // Rewritten Moving Average to completely eliminate floating-point drift
 template <uint8_t SIZE> class MovingAverage {
 private:
@@ -154,10 +166,14 @@ int main(void) {
   GPIO_InitStruct.Alternate = GPIO_AF3_USART2;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-  CAN_FilterTypeDef canFilterConfig;
+  CAN_FilterTypeDef canFilterConfig = {0};
   canFilterConfig.FilterBank = 0;
   canFilterConfig.FilterMode = CAN_FILTERMODE_IDMASK;
   canFilterConfig.FilterScale = CAN_FILTERSCALE_32BIT;
+  canFilterConfig.FilterIdHigh = 0x0000;
+  canFilterConfig.FilterIdLow = 0x0000;
+  canFilterConfig.FilterMaskIdHigh = 0x0000;
+  canFilterConfig.FilterMaskIdLow = 0x0000;
   canFilterConfig.FilterFIFOAssignment = CAN_RX_FIFO0;
   canFilterConfig.FilterActivation = ENABLE;
   HAL_CAN_ConfigFilter(&hcan1, &canFilterConfig);
@@ -197,7 +213,7 @@ int main(void) {
       float bmsAmps  = orion.getPackCurrent();     
       float bmsPowerWatts = bmsVolts * bmsAmps;
 
-      avgSOC.add(orion.getPackSOC());
+      avgSOC.add(estimateSOCFromVoltage(orion.getPackOpenVoltage()));
 
       if (bmsAmps >= 0) {
           avgPowerOut.add(fabsf(bmsPowerWatts)); 
@@ -240,10 +256,7 @@ void SystemClock_Config(void) {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
   if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK) Error_Handler();
-  HAL_PWR_EnableBkUpAccess();
-  __HAL_RCC_LSEDRIVE_CONFIG(RCC_LSEDRIVE_LOW);
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSE | RCC_OSCILLATORTYPE_MSI;
-  RCC_OscInitStruct.LSEState = RCC_LSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.MSICalibrationValue = 0;
   RCC_OscInitStruct.MSIClockRange = RCC_MSIRANGE_6;

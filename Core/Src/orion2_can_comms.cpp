@@ -27,7 +27,8 @@ HAL_StatusTypeDef Orion2::parseMeasurement(Orion2::MessageID id, const uint8_t *
   switch (id) {
   case MessageID::PackMeasurements: {
     // Extract raw mixed-width little-endian values and scale to floats
-    uint16_t rawCurrent, rawInstVoltage, rawOpenVoltage;
+    int16_t rawCurrent;
+    uint16_t rawInstVoltage, rawOpenVoltage;
     uint8_t rawSOC;
 
     memcpy(&rawCurrent, &rxData[0], sizeof(rawCurrent));
